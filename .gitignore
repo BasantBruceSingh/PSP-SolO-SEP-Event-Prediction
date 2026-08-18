@@ -1,0 +1,62 @@
+# -----------------------------
+# Large data / arrays
+# -----------------------------
+*.npy
+*.npz
+*.csv
+*.xlsx
+*.xls
+*.cdf
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.nc
+*.parquet
+
+# -----------------------------
+# Text and shell scripts
+# -----------------------------
+*.txt
+*.sh
+
+# -----------------------------
+# Model weights / outputs
+# -----------------------------
+*.pth
+*.pt
+*.ckpt
+model_weights/
+wandb/
+runs/
+outputs/
+figures/
+plots/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# -----------------------------
+# Python/cache
+# -----------------------------
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# -----------------------------
+# Environments / editor junk
+# -----------------------------
+.env
+.venv/
+venv/
+conda-meta/
+.DS_Store
+.vscode/
+
+# -----------------------------
+# Ignore initial_models by default.
+# Force-add only selected files from this directory.
+# -----------------------------
+initial_models/*
