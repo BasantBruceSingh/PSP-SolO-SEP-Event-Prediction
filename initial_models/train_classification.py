@@ -1,3 +1,5 @@
+"""Train binary SEP classifiers, save checkpoints, and score predictions."""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -5,13 +7,15 @@ import wandb
 from sklearn.metrics import confusion_matrix, accuracy_score
 import torch.optim.lr_scheduler as lr_scheduler
 import optuna
-
+import pandas as pd
 
 def sigmoid_np(x):
+    """Convert logits to probabilities with the logistic sigmoid."""
     return 1 / (1 + np.exp(-x))
 
 
 def check_accuracy(loader, model, threshold):
+    """Return the fraction of labels correctly predicted at the probability threshold."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
 
@@ -39,6 +43,7 @@ def check_accuracy(loader, model, threshold):
 
 
 def check_per_class_accuracy(loader, model, threshold):
+    """Return the fractions of correctly classified negative and positive samples, in that order."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device=device)
     dtype = torch.float32
@@ -75,6 +80,7 @@ def check_per_class_accuracy(loader, model, threshold):
 
 
 def compute_metrics(y_true, y_pred):
+    """Compute binary classification scores from true and predicted labels."""
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     TN, FP, FN, TP = cm.ravel()
 
@@ -114,45 +120,30 @@ def compute_metrics(y_true, y_pred):
 
 
 def get_metrics_from_model(loader, model, threshold):
-    # containers
-    y_pred, y_true = [], []
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float32
-
+    """Threshold model probabilities and compute metrics from one confusion matrix for the entire loader."""
+    device = next(model.parameters()).device
     model.eval()
 
-    with torch.no_grad():
-        for Xb, auxb, yb in loader:
-            preds = model(Xb.to(device), auxb.to(device))
-
-            y_pred.append(preds.cpu().numpy())
-            y_true.append(yb.numpy())
-
-    model.eval()
+    y_true = []
+    y_pred = []
 
     with torch.no_grad():
-        y_pred_raw = []
+        for X, mask, y in loader:
+            X = X.to(device, dtype=torch.float32)
+            mask = mask.to(device)
 
-        for Xb, auxb, yb in loader:
-            preds = model(Xb.to(device), auxb.to(device))
-            y_pred_raw.append(preds.cpu().numpy())
+            logits = model(X, mask)
+            probs = torch.sigmoid(logits)
 
-    # stack into a single array
-    y_pred_raw = np.concatenate([yp.reshape(-1) for yp in y_pred_raw])
+            predictions = (probs >= threshold).long()
 
-    # stack into arrays
-    y_true = np.concatenate([yb.reshape(-1) for yb in y_true]).astype(int)
+            y_true.append(y.cpu().numpy().reshape(-1))
+            y_pred.append(predictions.cpu().numpy().reshape(-1))
 
-    metrics_val = compute_metrics(
-        y_true,
-        (
-            np.vectorize(sigmoid_np)(np.concatenate(y_pred).reshape(-1))
-            > threshold
-        ).astype(int),
-    )
+    y_true = np.concatenate(y_true).astype(int)
+    y_pred = np.concatenate(y_pred).astype(int)
 
-    return metrics_val
+    return compute_metrics(y_true, y_pred)
 
 
 def train(
@@ -168,19 +159,16 @@ def train(
     trial=None,
     use_wandb=True,
 ):
-    """
-    Train a model using the PyTorch Module API.
+    """Train a weighted binary classifier and track validation performance.
 
-    Inputs:
-    - model: A PyTorch Module giving the model to train.
-    - optimizer: An Optimizer object we will use to train the model
-    - loader_train: A dataloader containing the train dataset
-    - loader_val: A dataloader containing the validation dataset
-    - epochs: (Optional) An integer giving the number of epochs to train for
-    - print_every: (Optional) An integer specifying how often to print the loss.
+    Loaders yield features, active-region masks, and binary labels. The positive
+    class receives ``weight`` in the loss. Validation TSS is computed at the
+    given probability threshold. Checkpoints are saved under ``model_weights/``
+    using ``model_name``, with separate files for best TSS and the final epoch.
+    An optional Optuna trial receives validation scores and can prune the run.
 
-    Returns:
-    Nothing, but prints model losses and accuracies during training.
+    Returns a tuple of per-epoch training accuracy, validation accuracy, and
+    validation TSS lists.
     """
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -198,6 +186,9 @@ def train(
                 "batch_size": 32,
             },
         )
+
+
+        
 
     scheduler = lr_scheduler.LinearLR(
         optimizer,
@@ -264,7 +255,7 @@ def train(
         train_losses = np.array(train_losses)
 
         if use_wandb:
-            wandb.log(
+            run.log(
                 {
                     "train_loss": train_losses.sum() / len(train_losses),
                     "train_accuracy": train_acc_this,
@@ -302,3 +293,61 @@ def train(
     torch.save(model.state_dict(), "model_weights/" + model_name + "_end.pth")
 
     return train_acc, val_acc, val_tss
+
+def get_weight_from_loader(loader):
+    """Return the negative-to-positive count ratio, or one when the loader has no positives."""
+    total_samples = 0
+    positive_samples = 0
+
+    for _, _, y in loader:
+        total_samples += y.shape[0]
+        positive_samples += y.sum().item()
+
+    negative_samples = total_samples - positive_samples
+
+    if positive_samples == 0:
+        return 1.0  # Avoid division by zero, though this case should be handled separately
+    else:
+        return negative_samples / positive_samples
+
+def evaluate_thresholds(model, loader, thresholds=np.arange(0.1, 1.0, 0.05)):
+    """Run inference once and return a DataFrame of validation scores for each probability threshold."""
+    device = next(model.parameters()).device
+    model.eval()
+
+    all_probs = []
+    all_labels = []
+
+    with torch.no_grad():
+        for X, mask, y in loader:
+            X = X.to(device)
+            mask = mask.to(device)
+
+            logits = model(X, mask)
+            probs = torch.sigmoid(logits)
+
+            all_probs.append(probs.cpu().numpy().reshape(-1))
+            all_labels.append(y.cpu().numpy().reshape(-1))
+
+    probs = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels).astype(int)
+
+    results = []
+
+    for threshold in thresholds:
+        pred = (probs >= threshold).astype(int)
+
+        metrics = compute_metrics(labels, pred)
+
+        results.append({
+            "threshold": threshold,
+            "F1": metrics["F1"],
+            "TSS": metrics["TSS"],
+            "HSS": metrics["HSS"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall/POD"],
+            "FAR": metrics["FAR"],
+            "accuracy": metrics["acc"],
+        })
+
+    return pd.DataFrame(results)

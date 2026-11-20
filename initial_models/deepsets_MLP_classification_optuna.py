@@ -1,194 +1,114 @@
+"""Tune DeepSets hyperparameters with Optuna."""
+
 import torch
-import torch.nn as nn
-import load_data_pointwise as load_data
-from train_classification import train, compute_metrics, get_metrics_from_model
-from sklearn.metrics import confusion_matrix, accuracy_score
 import argparse
-import numpy as np
-import optuna
+from set_classifiers import DeepSetEncoder, DeepSetMLPClassification
 
-parser = argparse.ArgumentParser(
-    description="Optuna tuning script for DeepSet MLP classification model on SEP prediction task"
-)
 
-parser.add_argument("--threshold", type=float, default=0.5,
-                    help="Classification threshold for converting probabilities to binary predictions")
+def main():
+    """Tune DeepSets hyperparameters with Optuna."""
+    parser = argparse.ArgumentParser(
+        description="Optuna tuning script for DeepSet MLP classification model on SEP prediction task"
+    )
 
-args = parser.parse_args()
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Classification threshold for converting probabilities to binary predictions")
 
-def sigmoid_np(x):
-    # Avoid overflow
-    if x < -10:
-        return 0
-    if x > 10:
-        return 1
-    return 1 / (1 + np.exp(-x))
+    args = parser.parse_args()
 
-class DeepSetEncoder(nn.Module):
-    def __init__(self, SHARP_length, individual_embedding_dim, set_embedding_dim, dropout):
-        super().__init__()
+    import load_data_pointwise as load_data
+    from train_classification import train, get_metrics_from_model
+    import optuna
 
-        self.phi = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(SHARP_length, individual_embedding_dim // 2),
-            nn.ReLU(),
-            nn.Linear(individual_embedding_dim // 2, individual_embedding_dim),
+    train_loader, val_loader, test_loader = load_data.load_data_pointwise()
+
+    def objective(trial):
+        """Train and evaluate one hyperparameter configuration for the Optuna study."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        d_model = 16
+        n_heads = 4
+
+        # d_model must be divisible by n_heads
+        if d_model % n_heads != 0:
+            raise optuna.exceptions.TrialPruned()
+
+        num_layers = trial.suggest_int("num_layers", 1, 2)
+        mlp_hidden = trial.suggest_categorical("mlp_hidden", [4, 8, 16])
+        dropout = trial.suggest_float("dropout", 0.1, 0.6)
+
+        learning_rate = trial.suggest_float(
+            "learning_rate",
+            1e-5,
+            3e-3,
+            log=True,
         )
 
-        self.rho = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(individual_embedding_dim, set_embedding_dim),
-            nn.ReLU(),
-            nn.Linear(set_embedding_dim, set_embedding_dim),
-        )
+        weight_decay = 5e-6
 
-    def forward(self, x, mask):
-        h = self.phi(x)
+        individual_embedding_dim = 8
 
-        mask = mask.unsqueeze(-1)
+        set_embedding_dim = 8
 
-        h = h * mask
-
-        counts = mask.sum(dim=1).clamp(min=1.0)
-        pooled = h.sum(dim=1) / counts
-
-        z = self.rho(pooled)
-
-        return z
-
-class DeepSetMLPClassification(nn.Module):
-    def __init__(
-        self,
-        SHARP_length,
-        d_model,
-        n_heads,
-        num_layers,
-        mlp_hidden,
-        dropout,
-        individual_embedding_dim,
-        set_embedding_dim
-    ):
-        super().__init__()
-
-        self.set_encoder = DeepSetEncoder(
-            SHARP_length=SHARP_length,
+        model = DeepSetMLPClassification(
+            SHARP_length=10,
+            mlp_hidden=mlp_hidden,
+            dropout=dropout,
             individual_embedding_dim=individual_embedding_dim,
-            set_embedding_dim=set_embedding_dim,
-            dropout=dropout
+            set_embedding_dim=set_embedding_dim
+        ).to(device)
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
         )
 
-        self.body = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(set_embedding_dim, mlp_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden, 1),
+        max_epochs = 100
+
+        train(
+            "DeepSet MLP Classifier Optuna v3",
+            model,
+            optimizer,
+            train_loader,
+            val_loader,
+            threshold=args.threshold,
+            epochs=max_epochs,
+            trial=trial,
+            use_wandb=False
         )
 
-    def forward(self, x, ar_mask):
-        """
-        x:       [B, A, F]
-        ar_mask: [B, A]
-        """
+        val_metrics = get_metrics_from_model(
+            val_loader,
+            model,
+            threshold=args.threshold,
+        )
 
-        z = self.set_encoder(x, ar_mask)
+        return val_metrics["TSS"]
 
-        pred = self.body(z)
+    study = optuna.create_study(
+            direction="maximize",
+            study_name="sep_deepsets_tss_v3",
+            storage="sqlite:///optuna_sep_deepsets_tss_v3.db",
+            load_if_exists=True,
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=5,
+                n_warmup_steps=5,
+            ),
+        )
 
-        return pred.squeeze(-1)
-
-train_loader = load_data.train_loader
-val_loader = load_data.val_loader
-test_loader = load_data.test_loader
-
-def objective(trial):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    d_model = 16
-    n_heads = 4
-
-    # d_model must be divisible by n_heads
-    if d_model % n_heads != 0:
-        raise optuna.exceptions.TrialPruned()
-
-    num_layers = trial.suggest_int("num_layers", 1, 2)
-    mlp_hidden = trial.suggest_categorical("mlp_hidden", [4, 8, 16])
-    dropout = trial.suggest_float("dropout", 0.1, 0.6)
-
-    learning_rate = trial.suggest_float(
-        "learning_rate",
-        1e-5,
-        3e-3,
-        log=True,
+    study.optimize(
+        objective,
+        n_trials=100,
+        timeout=None,
     )
 
-    weight_decay = 5e-6
+    print("\nBest trial:")
+    print("value:", study.best_trial.value)
+    print("params:")
+    for k, v in study.best_trial.params.items():
+        print(f"  {k}: {v}")
 
-    individual_embedding_dim = 8
 
-    set_embedding_dim = 8
-
-    model = DeepSetMLPClassification(
-        SHARP_length=10,
-        d_model=d_model,
-        n_heads=n_heads,
-        num_layers=num_layers,
-        mlp_hidden=mlp_hidden,
-        dropout=dropout,
-        individual_embedding_dim=individual_embedding_dim,
-        set_embedding_dim=set_embedding_dim
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
-
-    train_loader = load_data.train_loader
-    val_loader = load_data.val_loader
-
-    max_epochs = 100
-
-    train(
-        "DeepSet MLP Classifier Optuna v3",
-        model,
-        optimizer,
-        train_loader,
-        val_loader,
-        threshold=args.threshold,
-        epochs=max_epochs,
-        trial=trial,
-        use_wandb=False
-    )
-
-    val_metrics = get_metrics_from_model(
-        val_loader,
-        model,
-        threshold=args.threshold,
-    )
-
-    return val_metrics["TSS"]
-
-study = optuna.create_study(
-        direction="maximize",
-        study_name="sep_deepsets_tss_v3",
-        storage="sqlite:///optuna_sep_deepsets_tss_v3.db",
-        load_if_exists=True,
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=5,
-            n_warmup_steps=5,
-        ),
-    )
-
-study.optimize(
-    objective,
-    n_trials=100,
-    timeout=None,
-)
-
-print("\nBest trial:")
-print("value:", study.best_trial.value)
-print("params:")
-for k, v in study.best_trial.params.items():
-    print(f"  {k}: {v}")
+if __name__ == "__main__":
+    main()

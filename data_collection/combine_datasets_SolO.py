@@ -1,3 +1,5 @@
+"""Align Solar Orbiter particle flux with SHARP observations."""
+
 import pandas as pd
 import numpy as np
 import datetime
@@ -136,8 +138,9 @@ def test_find_SHARP_for_SolO_time():
 test_find_SHARP_for_SolO_time()
 
 def compute_mean_flux(times, linlin, time, window_hrs=12):
-    start = np.datetime64(pd.to_datetime(time), "ns")
-    end = np.datetime64(pd.to_datetime(time) + pd.Timedelta(hours=window_hrs), "ns")
+    """Average flux over the preceding window, with an exclusive end time."""
+    start = np.datetime64(pd.to_datetime(time) - pd.Timedelta(hours=window_hrs), "ns")
+    end = np.datetime64(pd.to_datetime(time), "ns")
 
     left = np.searchsorted(times, start, side="left")
     right = np.searchsorted(times, end, side="left")  # exclusive end
@@ -148,6 +151,7 @@ def compute_mean_flux(times, linlin, time, window_hrs=12):
     return np.nanmean(linlin[left:right])
 
 def compute_mean_flux_cadence(times, smoothed_linlin, time, cadence_hours):
+    """Average flux in the cadence window centered on ``time``, returning NaN when it is empty."""
     start = np.datetime64(pd.to_datetime(time) - pd.Timedelta(hours=cadence_hours/2), "ns")
     end = np.datetime64(pd.to_datetime(time) + pd.Timedelta(hours=cadence_hours/2), "ns")
 
@@ -205,7 +209,7 @@ for offset_SolO_time, SolO_time, Jlinlin, footprint_valid, lon, r, footprint_lon
         row = {"ARPNUM": ARPNUM}
         for col in SHARP_columns:
             row[col] = np.mean(measurements[col])
-        result_dict = {"time": SolO_time, "Jlinlin": compute_mean_flux_cadence(times, smoothed_linlin, SolO_time, cadence_hours), "Jlinlin_raw": Jlinlin, "ARPNUM": ARPNUM, "hgs_lon": lon, "spacecraft_r": r, "footprint_lon": footprint_lon}
+        result_dict = {"time": SolO_time, "SHARP time": offset_SolO_time, "Jlinlin": compute_mean_flux_cadence(times, smoothed_linlin, SolO_time, cadence_hours), "Jlinlin_raw": Jlinlin, "ARPNUM": ARPNUM, "hgs_lon": lon, "spacecraft_r": r, "footprint_lon": footprint_lon}
         for col in SHARP_columns:
             result_dict[col] = row[col]
         results.append(result_dict)

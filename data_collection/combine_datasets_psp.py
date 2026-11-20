@@ -1,3 +1,5 @@
+"""Align Parker Solar Probe particle flux with SHARP observations."""
+
 import pandas as pd
 import numpy as np
 import datetime
@@ -33,7 +35,7 @@ def find_SHARP_for_psp_time(target_time, SHARP_times, window_hours=1):
     # Binary search to find the range of SHARP times within the window around target_time
     if SHARP_times[0] - pd.Timedelta(hours=window_hours) > target_time:
         return 0, 0
-    if SHARP_times[-1] + pd.Timedelta(hours=window_hours) < target_time:
+    if SHARP_times[-1] < target_time:
         return len(SHARP_times) - 1, len(SHARP_times) - 1
 
     # Find bottom of the window
@@ -65,7 +67,7 @@ def find_SHARP_for_psp_time(target_time, SHARP_times, window_hours=1):
     top_SHARP_index = None
     while low < high:
         mid = (low + high) // 2
-        window_end = target_time + pd.Timedelta(hours=window_hours)
+        window_end = target_time
         # If the mid sharp time is above the window, move the high pointer down
         if SHARP_times[mid] > window_end:
             high = mid - 1
@@ -103,7 +105,7 @@ def test_find_SHARP_for_psp_time():
 
     bottom_index, top_index = find_SHARP_for_psp_time(target_time, SHARP_times, window_hours)
     assert bottom_index == 2, f"Expected bottom index 2, got {bottom_index}"
-    assert top_index == 4, f"Expected top index 4, got {top_index}"
+    assert top_index == 2, f"Expected top index 2, got {top_index}"
 
     SHARP_times = pd.to_datetime([
         "2024-01-01 00:00:00",
@@ -116,7 +118,7 @@ def test_find_SHARP_for_psp_time():
     window_hours = 2
     bottom_index, top_index = find_SHARP_for_psp_time(target_time, SHARP_times, window_hours)
     assert bottom_index == 0, f"Expected bottom index 0, got {bottom_index}"
-    assert top_index == 3, f"Expected top index 3, got {top_index}"
+    assert top_index == 1, f"Expected top index 1, got {top_index}"
 
     SHARP_times = pd.to_datetime([
         "2024-01-01 00:00:00",
@@ -136,14 +138,16 @@ def test_find_SHARP_for_psp_time():
 test_find_SHARP_for_psp_time()
 
 def compute_mean_flux(df, time, window_hrs=12):
+    """Average PSP flux from ``time`` through the end of the following window."""
     mask = (pd.to_datetime(df["time"], format="mixed") >= pd.to_datetime(time)) & (pd.to_datetime(df["time"], format="mixed") <= pd.to_datetime(time) + pd.Timedelta(hours=window_hrs))
     if not mask.any():
         return np.nan
     return np.nanmean(df.loc[mask, "psp_epilo_jlinlin_flux"])
 
 def compute_mean_flux(times, linlin, time, window_hrs=12):
-    start = np.datetime64(pd.to_datetime(time), "ns")
-    end = np.datetime64(pd.to_datetime(time) + pd.Timedelta(hours=window_hrs), "ns")
+    """Average flux over the preceding window, with an inclusive end time."""
+    start = np.datetime64(pd.to_datetime(time) - pd.Timedelta(hours=window_hrs), "ns")
+    end = np.datetime64(pd.to_datetime(time), "ns")
 
     left = np.searchsorted(times, start, side="left")
     right = np.searchsorted(times, end, side="right")  # inclusive end
@@ -154,6 +158,7 @@ def compute_mean_flux(times, linlin, time, window_hrs=12):
     return np.nanmean(linlin[left:right])
     
 def compute_mean_flux_cadence(times, smoothed_linlin, time, cadence_hours):
+    """Average flux in the cadence window centered on ``time``, returning NaN when it is empty."""
     start = np.datetime64(pd.to_datetime(time) - pd.Timedelta(hours=cadence_hours/2), "ns")
     end = np.datetime64(pd.to_datetime(time) + pd.Timedelta(hours=cadence_hours/2), "ns")
 
@@ -210,7 +215,7 @@ for offset_psp_time, psp_time, Jlinlin, footprint_valid, lon, r, footprint_lon i
         row = {"ARPNUM": ARPNUM}
         for col in SHARP_columns:
             row[col] = np.mean(measurements[col])
-        result_dict = {"time": psp_time, "Jlinlin": compute_mean_flux_cadence(times, smoothed_linlin, psp_time, cadence_hours), "Jlinlin_raw":Jlinlin, "ARPNUM": ARPNUM, "hgs_lon": lon, "spacecraft_r": r, "footprint_lon": footprint_lon}
+        result_dict = {"time": psp_time, "SHARP time": offset_psp_time, "Jlinlin": compute_mean_flux_cadence(times, smoothed_linlin, psp_time, cadence_hours), "Jlinlin_raw":Jlinlin, "ARPNUM": ARPNUM, "hgs_lon": lon, "spacecraft_r": r, "footprint_lon": footprint_lon}
         for col in SHARP_columns:
             result_dict[col] = row[col]
         results.append(result_dict)

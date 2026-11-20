@@ -1,3 +1,5 @@
+"""Fit and score a single-threshold classification baseline."""
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import confusion_matrix, accuracy_score
@@ -8,10 +10,12 @@ cols = ["USFLUXL", "R_VALUE", "MEANGBL_GMM", "USFLUXZ", "MEANGBZ", "CMASKL", "LA
 
 class DecisionStump:
     def __init__(self, feature_index=None, threshold=None, polarity=1):
+        """Initialize the feature index, decision threshold, and threshold polarity."""
         self.threshold = threshold
         self.polarity = polarity
 
     def fit(self, x, y):
+        """Search thresholds and polarities and store the pair with the highest training score."""
         n_samples = x.shape[0]
 
         max_score = -float('inf')
@@ -32,6 +36,7 @@ class DecisionStump:
                     self.polarity = polarity
 
     def predict(self, x):
+        """Classify samples using the fitted threshold and polarity."""
         n_samples = x.shape[0]
         predictions = np.ones(n_samples)
 
@@ -43,6 +48,7 @@ class DecisionStump:
         return predictions
     
     def compute_metrics(self, y_true, y_pred):
+        """Compute binary classification scores from true and predicted labels."""
         cm = confusion_matrix(y_true, y_pred, labels=[0,1])
         TN, FP, FN, TP = cm.ravel()
 
@@ -85,6 +91,7 @@ class DecisionStump:
         }
 
     def prediction_metrics(self, x, y):
+        """Classify the input samples and score the predictions against their labels."""
         predictions = self.predict(x)
         return self.compute_metrics(y, predictions)
 

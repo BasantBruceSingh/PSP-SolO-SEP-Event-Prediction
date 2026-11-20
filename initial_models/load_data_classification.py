@@ -1,3 +1,5 @@
+"""Prepare masked SHARP sequences for binary classification."""
+
 from torch.utils.data import DataLoader, Dataset
 import torch
 import pandas as pd
@@ -74,6 +76,7 @@ def make_nonoverlap_block_split(num_times, seq_len, block_size, train_frac=0.7, 
     return train_blocks, val_blocks, test_blocks
 
 def make_windows_from_blocks(X_time, mask_time, y_time, blocks, seq_len):
+    """Construct sequences within each time block and pair them with masks and targets."""
     X_seq = []
     mask_seq = []
     y_seq = []
@@ -152,14 +155,17 @@ print("y_test:", y_test.shape)
 
 class SHARPLinlinSequenceDataset(Dataset):
     def __init__(self, X, ar_mask, y):
+        """Store features, active-region masks, and targets as tensors."""
         self.X = torch.tensor(X, dtype=torch.float32)
         self.ar_mask = torch.tensor(ar_mask, dtype=torch.bool)
         self.y = torch.tensor(y, dtype=torch.float32)
 
     def __len__(self):
+        """Return the number of samples in the dataset."""
         return len(self.y)
 
     def __getitem__(self, idx):
+        """Return the feature tensor, active-region mask, and target at index ``idx``."""
         return self.X[idx], self.ar_mask[idx], self.y[idx]
 
 batch_size = 32

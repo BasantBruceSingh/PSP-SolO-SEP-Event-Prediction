@@ -1,12 +1,16 @@
+"""Generate combined pointwise splits that retain individual active regions."""
+
+
 import os
 import random
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-# -----------------------------
-# Config
-# -----------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 SEED = 0
 random.seed(SEED)
 np.random.seed(SEED)
@@ -29,6 +33,7 @@ cols = [
 
 EVENT_WINDOW = pd.Timedelta(days=10)
 Y_EPS = 1e-5
+SPLITS = ("train", "val", "test")
 
 SAT_CONFIGS = {
     "psp": {
@@ -47,70 +52,76 @@ SAT_CONFIGS = {
 }
 
 
-# -----------------------------
-# Time / catalogue helpers
-# -----------------------------
+# ============================================================
+# TIME / CATALOGUE HELPERS
+# ============================================================
+
 def parse_time_series(s):
+    """Parse timestamp strings and represent UTC times without a timezone attached."""
     return pd.to_datetime(
         s.astype(str).str.strip(),
         format="mixed",
         errors="coerce",
-    )
+        utc=True
+    ).dt.tz_localize(None)
 
 
-def load_psp_start_times(path, start_col):
-    df = pd.read_csv(path)
+def load_event_times(config):
+    """Read catalogue event onsets for the specified spacecraft."""
+    if config["catalogue_type"] == "csv":
+        df = pd.read_csv(config["catalogue_path"])
+        raw = df[config["start_col"]]
 
-    start_times = parse_time_series(df[start_col])
-    start_times = start_times.dropna().sort_values().to_list()
+    elif config["catalogue_type"] == "xlsx":
+        df = pd.read_excel(config["catalogue_path"])
+        raw = df.iloc[
+            config["skip_rows_before"]:,
+            config["start_col_index"]
+        ]
 
-    if len(start_times) == 0:
-        raise ValueError(f"No valid PSP event start times found in {path}")
+    else:
+        raise ValueError("Unknown catalogue type")
 
-    return start_times
+    times = parse_time_series(raw)
+    times = times.dropna().sort_values().to_list()
 
+    if len(times) == 0:
+        raise ValueError("No valid SEP event times")
 
-def load_solo_start_times(path, start_col_index=28, skip_rows_before=4):
-    df = pd.read_excel(path)
-
-    raw = df.iloc[skip_rows_before:, start_col_index]
-    start_times = pd.to_datetime(
-        raw.astype(str).str.strip(),
-        format="mixed",
-        errors="coerce",
-    )
-
-    start_times = start_times.dropna().sort_values().to_list()
-
-    if len(start_times) == 0:
-        raise ValueError(f"No valid SolO event start times found in {path}")
-
-    return start_times
+    return times
 
 
 def merge_event_windows(start_times, window=EVENT_WINDOW):
     """
-    Convert event starts into merged [start, start + window] intervals.
-    This keeps overlapping/nearby SEP event windows together.
+    Merge SEP event windows from both PSP and SolO.
+
+    Each event contributes [start, start + 10 days].
+    Overlapping windows are merged.
     """
-    windows = [(t, t + window) for t in sorted(start_times)]
+    windows = sorted(
+        (t, t + window) for t in start_times
+    )
 
     merged = []
+
     for start, end in windows:
         if not merged or start > merged[-1][1]:
             merged.append([start, end])
         else:
             merged[-1][1] = max(merged[-1][1], end)
 
-    return [(s, e) for s, e in merged]
+    return [(start, end) for start, end in merged]
 
 
-# -----------------------------
-# Build point-level AR tensors
-# -----------------------------
+# ============================================================
+# BUILD NON-AGGREGATED SHARP TENSORS
+# ============================================================
+
 def aggregate_sharp_by_time(combined_csv, satellite_name):
     """
-    Converts AR-level SHARP rows into one point per satellite time.
+    Convert AR-level SHARP rows into one sample per satellite time.
+
+    No averaging across active regions.
 
     Returns:
         X_time:    [T, A_sat, F]
@@ -120,203 +131,279 @@ def aggregate_sharp_by_time(combined_csv, satellite_name):
     """
     df = pd.read_csv(combined_csv)
 
-    df["time"] = parse_time_series(df["time"])
-    df = df.dropna()
-    df = df.sort_values("time").reset_index(drop=True)
+    required = ["time", "Jlinlin"] + cols
+    missing = [c for c in required if c not in df.columns]
 
-    missing = [c for c in cols + ["Jlinlin"] if c not in df.columns]
     if missing:
-        raise ValueError(f"{combined_csv} missing columns: {missing}")
+        raise ValueError(
+            f"{combined_csv} missing columns: {missing}"
+        )
+
+    df["time"] = parse_time_series(df["time"])
+    df = df.dropna(subset=required)
+    df = df.sort_values("time", kind="stable").reset_index(drop=True)
 
     groups = list(df.groupby("time", sort=True))
 
     if len(groups) == 0:
-        raise ValueError(f"No valid time groups found in {combined_csv}")
+        raise ValueError(
+            f"No valid time groups in {combined_csv}"
+        )
 
     max_num_ARs = max(len(g) for _, g in groups)
     num_features = len(cols)
 
-    X_time = []
-    mask_time = []
-    y_time = []
+    X_time = np.zeros(
+        (len(groups), max_num_ARs, num_features),
+        dtype=np.float32
+    )
+
+    mask_time = np.zeros(
+        (len(groups), max_num_ARs),
+        dtype=bool
+    )
+
+    y_time = np.zeros(len(groups), dtype=np.float32)
     times = []
 
-    for time, g in tqdm(groups, desc=f"Building AR tensors for {satellite_name}"):
-        features = g[cols].to_numpy(dtype=np.float64)
+    for i, (time, g) in enumerate(
+        tqdm(groups, desc=f"Building AR tensors for {satellite_name}")
+    ):
+        features = g[cols].to_numpy(dtype=np.float32)
         n_ar = len(features)
 
-        X_t = np.zeros((max_num_ARs, num_features), dtype=np.float64)
-        mask_t = np.zeros((max_num_ARs,), dtype=bool)
+        X_time[i, :n_ar, :] = features
+        mask_time[i, :n_ar] = True
 
-        X_t[:n_ar, :] = features
-        mask_t[:n_ar] = True
+        targets = g["Jlinlin"].to_numpy(dtype=np.float64)
 
-        # Raw continuous target. Do not threshold here.
-        y_t = float(g["Jlinlin"].iloc[0])
+        # One satellite target per timestamp.
+        if not np.allclose(
+            targets, targets[0], rtol=1e-5, atol=1e-10
+        ):
+            raise ValueError(
+                f"{satellite_name}: inconsistent Jlinlin at {time}"
+            )
 
-        X_time.append(X_t)
-        mask_time.append(mask_t)
-        y_time.append(y_t)
+        y_time[i] = targets[0]
         times.append(time)
 
-    X_time = np.stack(X_time).astype(np.float32)
-    mask_time = np.stack(mask_time).astype(bool)
-    y_time = np.array(y_time, dtype=np.float32)
     times = np.array(times, dtype="datetime64[ns]")
 
-    return X_time, mask_time, y_time, times
+    return {
+        "X_time": X_time,
+        "mask_time": mask_time,
+        "y_time": y_time,
+        "times": times,
+    }
 
 
-# -----------------------------
-# Blocking / splitting
-# -----------------------------
-def make_blocks_from_event_windows(times, event_windows, max_non_event_window=EVENT_WINDOW):
+# ============================================================
+# BUILD SHARED TEMPORAL BLOCKS
+# ============================================================
+
+def build_shared_blocks(all_times, event_windows):
     """
-    Make blocks such that:
-      - all points within each merged 10-day SEP event window stay together
-      - non-event points are chunked into <=10-day blocks
+    Construct temporal blocks using the union of PSP and SolO times.
+
+    All observations belonging to the same block receive
+    the same train/val/test assignment.
+
+    Event blocks:
+        One block per merged SEP event window.
+
+    Non-event blocks:
+        Consecutive non-event observations in <=10-day chunks.
     """
-    times_ts = pd.to_datetime(times)
+    all_times = pd.DatetimeIndex(all_times).sort_values().unique()
 
-    event_blocks = []
-    non_events = []
+    if len(all_times) == 0:
+        raise ValueError("No observation timestamps")
 
-    event_ptr = 0
-    current_event_block = []
+    event_membership = np.full(
+        len(all_times), -1, dtype=int
+    )
 
-    for i, t in enumerate(times_ts):
-        # Advance past event windows that ended before this time.
-        while event_ptr < len(event_windows) and t > event_windows[event_ptr][1]:
-            if len(current_event_block) > 0:
-                event_blocks.append(current_event_block)
-                current_event_block = []
-            event_ptr += 1
+    # Assign timestamps to merged event windows.
+    for event_id, (start, end) in enumerate(event_windows):
+        selected = (all_times >= start) & (all_times <= end)
+        event_membership[selected] = event_id
 
-        if event_ptr < len(event_windows):
-            start, end = event_windows[event_ptr]
-            in_event = start <= t <= end
-        else:
-            in_event = False
+    blocks = []
+    block_ids = np.full(len(all_times), -1, dtype=int)
 
-        if in_event:
-            current_event_block.append(i)
-        else:
-            if len(current_event_block) > 0:
-                event_blocks.append(current_event_block)
-                current_event_block = []
-            non_events.append(i)
+    # Event blocks
+    for event_id in range(len(event_windows)):
+        indices = np.flatnonzero(event_membership == event_id)
 
-    if len(current_event_block) > 0:
-        event_blocks.append(current_event_block)
-
-    # Chunk non-events into <=10-day blocks.
-    non_event_blocks = []
-    block = []
-
-    for idx in non_events:
-        if len(block) == 0:
-            block = [idx]
+        if len(indices) == 0:
             continue
 
-        block_start_time = times_ts[block[0]]
-        this_time = times_ts[idx]
+        block_id = len(blocks)
 
-        if this_time > block_start_time + max_non_event_window:
-            non_event_blocks.append(block)
-            block = [idx]
+        blocks.append({
+            "id": block_id,
+            "type": "event",
+            "indices": indices
+        })
+
+        block_ids[indices] = block_id
+
+    # Non-event blocks
+    non_event_indices = np.flatnonzero(event_membership == -1)
+
+    current = []
+
+    def append_non_event_block(indices):
+        """Register a nonempty quiet-time block and assign its ID to its timestamps."""
+        if len(indices) == 0:
+            return
+
+        indices = np.array(indices, dtype=int)
+        block_id = len(blocks)
+
+        blocks.append({
+            "id": block_id,
+            "type": "non_event",
+            "indices": indices
+        })
+
+        block_ids[indices] = block_id
+
+    for idx in non_event_indices:
+        if len(current) == 0:
+            current = [int(idx)]
+            continue
+
+        start_time = all_times[current[0]]
+        current_time = all_times[idx]
+
+        if current_time > start_time + EVENT_WINDOW:
+            append_non_event_block(current)
+            current = [int(idx)]
         else:
-            block.append(idx)
+            current.append(int(idx))
 
-    if len(block) > 0:
-        non_event_blocks.append(block)
+    append_non_event_block(current)
 
-    return event_blocks, non_event_blocks
+    assert np.all(block_ids >= 0)
+    assert sum(len(b["indices"]) for b in blocks) == len(all_times)
+
+    return blocks, block_ids, all_times
 
 
-def split_blocks(event_blocks, non_event_blocks, train_frac=0.70, val_frac=0.15):
+# ============================================================
+# SPLIT SHARED BLOCKS
+# ============================================================
+
+def split_shared_blocks(
+    blocks,
+    seed=SEED,
+    train_frac=0.70,
+    val_frac=0.15
+):
     """
-    Split event and non-event blocks separately so each split gets both types.
+    Randomly assign shared blocks to train/val/test.
+
+    Event and non-event blocks are split separately.
+
+    Fractions apply to block counts, not individual samples.
     """
-    event_blocks = list(event_blocks)
-    non_event_blocks = list(non_event_blocks)
+    rng = random.Random(seed)
+    assignments = {}
 
-    random.shuffle(event_blocks)
-    random.shuffle(non_event_blocks)
+    for block_type in ("event", "non_event"):
 
-    def split_one(blocks):
-        n = len(blocks)
+        selected = [
+            b["id"]
+            for b in blocks
+            if b["type"] == block_type
+        ]
+
+        rng.shuffle(selected)
+
+        n = len(selected)
         n_train = int(n * train_frac)
         n_val = int(n * val_frac)
 
-        train = blocks[:n_train]
-        val = blocks[n_train:n_train + n_val]
-        test = blocks[n_train + n_val:]
+        for bid in selected[:n_train]:
+            assignments[bid] = "train"
 
-        return train, val, test
+        for bid in selected[n_train:n_train + n_val]:
+            assignments[bid] = "val"
 
-    e_train, e_val, e_test = split_one(event_blocks)
-    n_train, n_val, n_test = split_one(non_event_blocks)
+        for bid in selected[n_train + n_val:]:
+            assignments[bid] = "test"
 
-    train_blocks = e_train + n_train
-    val_blocks = e_val + n_val
-    test_blocks = e_test + n_test
+    assert len(assignments) == len(blocks)
 
-    random.shuffle(train_blocks)
-    random.shuffle(val_blocks)
-    random.shuffle(test_blocks)
-
-    return train_blocks, val_blocks, test_blocks
+    return assignments
 
 
-# -----------------------------
-# Split extraction / padding
-# -----------------------------
-def points_from_blocks(X_time, mask_time, y_time, times, blocks, satellite_name):
+# ============================================================
+# EXTRACT SATELLITE SAMPLES USING SHARED ASSIGNMENTS
+# ============================================================
+
+def extract_satellite_splits(
+    data,
+    global_times,
+    global_block_ids,
+    assignments
+):
     """
-    Extract point-level samples from split blocks.
-
-    Returns:
-        X:    [N, A_sat, F]
-        mask: [N, A_sat]
-        y:    [N]
-        t:    [N]
-        sat:  [N]
+    Assign each satellite observation according to its
+    globally shared temporal block.
     """
-    blocks = [b for b in blocks if len(b) > 0]
+    lookup = {
+        pd.Timestamp(t): assignments[int(bid)]
+        for t, bid in zip(global_times, global_block_ids)
+    }
 
-    if len(blocks) == 0:
-        return (
-            np.empty((0, X_time.shape[1], X_time.shape[2]), dtype=np.float32),
-            np.empty((0, mask_time.shape[1]), dtype=bool),
-            np.empty((0,), dtype=np.float32),
-            np.empty((0,), dtype="datetime64[ns]"),
-            np.empty((0,), dtype="<U8"),
-        )
+    sample_splits = np.array([
+        lookup[pd.Timestamp(t)]
+        for t in data["times"]
+    ])
 
-    indices = np.concatenate([np.array(b, dtype=int) for b in blocks])
+    result = {}
 
-    X = X_time[indices]
-    mask = mask_time[indices]
-    y = y_time[indices]
-    t = times[indices]
-    sat = np.array([satellite_name] * len(indices), dtype="<U8")
+    for split in SPLITS:
+        indices = np.flatnonzero(sample_splits == split)
 
-    return X, mask, y, t, sat
+        result[f"X_{split}"] = data["X_time"][indices].copy()
+        result[f"mask_{split}"] = data["mask_time"][indices].copy()
+        result[f"y_{split}_raw"] = data["y_time"][indices].copy()
+        result[f"t_{split}"] = data["times"][indices].copy()
 
+    return result
+
+
+# ============================================================
+# PAD PSP AND SOLO TO COMMON AR DIMENSION
+# ============================================================
 
 def pad_point_split(X, mask, global_max_ARs):
     """
-    Pads point-level X/mask:
-        X:    [N, A, F]
-        mask: [N, A]
+    X:    [N, A_sat, F]
+    mask: [N, A_sat]
+
+    Returns:
+        X:    [N, global_max_ARs, F]
+        mask: [N, global_max_ARs]
     """
     N, A, F = X.shape
 
     if A == global_max_ARs:
         return X, mask
 
-    X_padded = np.zeros((N, global_max_ARs, F), dtype=X.dtype)
-    mask_padded = np.zeros((N, global_max_ARs), dtype=bool)
+    X_padded = np.zeros(
+        (N, global_max_ARs, F),
+        dtype=np.float32
+    )
+
+    mask_padded = np.zeros(
+        (N, global_max_ARs),
+        dtype=bool
+    )
 
     X_padded[:, :A, :] = X
     mask_padded[:, :A] = mask
@@ -324,163 +411,18 @@ def pad_point_split(X, mask, global_max_ARs):
     return X_padded, mask_padded
 
 
-# -----------------------------
-# Build per-satellite data
-# -----------------------------
-def build_satellite_dataset(satellite_name, config):
-    if config["catalogue_type"] == "csv":
-        start_times = load_psp_start_times(
-            config["catalogue_path"],
-            config["start_col"],
-        )
-    elif config["catalogue_type"] == "xlsx":
-        start_times = load_solo_start_times(
-            config["catalogue_path"],
-            start_col_index=config["start_col_index"],
-            skip_rows_before=config["skip_rows_before"],
-        )
-    else:
-        raise ValueError(f"Unknown catalogue_type: {config['catalogue_type']}")
+# ============================================================
+# SHARED SHARP FEATURE NORMALIZATION
+# ============================================================
 
-    event_windows = merge_event_windows(start_times, EVENT_WINDOW)
-
-    X_time, mask_time, y_time, times = aggregate_sharp_by_time(
-        config["combined_csv"],
-        satellite_name=satellite_name,
-    )
-
-    event_blocks, non_event_blocks = make_blocks_from_event_windows(
-        times,
-        event_windows,
-    )
-
-    print(f"\n{satellite_name.upper()} block summary")
-    print("time points:", len(times))
-    print("max ARs:", X_time.shape[1])
-    print("num features:", X_time.shape[2])
-    print("event blocks:", len(event_blocks))
-    print("non-event blocks:", len(non_event_blocks))
-    print("event points:", sum(len(b) for b in event_blocks))
-    print("non-event points:", sum(len(b) for b in non_event_blocks))
-
-    train_blocks, val_blocks, test_blocks = split_blocks(
-        event_blocks,
-        non_event_blocks,
-    )
-
-    X_train, mask_train, y_train_raw, t_train, sat_train = points_from_blocks(
-        X_time,
-        mask_time,
-        y_time,
-        times,
-        train_blocks,
-        satellite_name,
-    )
-    X_val, mask_val, y_val_raw, t_val, sat_val = points_from_blocks(
-        X_time,
-        mask_time,
-        y_time,
-        times,
-        val_blocks,
-        satellite_name,
-    )
-    X_test, mask_test, y_test_raw, t_test, sat_test = points_from_blocks(
-        X_time,
-        mask_time,
-        y_time,
-        times,
-        test_blocks,
-        satellite_name,
-    )
-
-    return {
-        "X_time": X_time,
-        "mask_time": mask_time,
-        "times": times,
-
-        "X_train": X_train,
-        "mask_train": mask_train,
-        "y_train_raw": y_train_raw,
-        "t_train": t_train,
-        "sat_train": sat_train,
-
-        "X_val": X_val,
-        "mask_val": mask_val,
-        "y_val_raw": y_val_raw,
-        "t_val": t_val,
-        "sat_val": sat_val,
-
-        "X_test": X_test,
-        "mask_test": mask_test,
-        "y_test_raw": y_test_raw,
-        "t_test": t_test,
-        "sat_test": sat_test,
-    }
-
-
-# -----------------------------
-# Feature normalization
-# -----------------------------
 def fit_X_normalization_from_train(datasets):
     """
-    Fit X normalization from real AR rows in train splits only.
-    """
-    train_real_rows = []
+    Fit SHARP feature normalization using PSP + SolO
+    training observations only.
 
-    for _, data in datasets.items():
-        X_train = data["X_train"]
-        mask_train = data["mask_train"]
+    Padded AR rows are excluded.
 
-        if len(X_train) == 0:
-            continue
-
-        train_real_rows.append(X_train[mask_train])
-
-    if len(train_real_rows) == 0:
-        raise ValueError("No real train AR rows found for X normalization.")
-
-    train_real_rows = np.concatenate(train_real_rows, axis=0)
-
-    X_mean = np.nanmean(train_real_rows, axis=0)
-    X_std = np.nanstd(train_real_rows, axis=0)
-
-    X_mean[~np.isfinite(X_mean)] = 0.0
-    X_std[~np.isfinite(X_std)] = 1.0
-    X_std[X_std == 0] = 1.0
-
-    return X_mean.astype(np.float32), X_std.astype(np.float32)
-
-
-def apply_X_normalization_to_splits(datasets, X_mean, X_std):
-    """
-    Apply train-only X normalization to real AR rows in train/val/test.
-    Padded rows remain zero.
-    """
-    for _, data in datasets.items():
-        for split in ["train", "val", "test"]:
-            X_key = f"X_{split}"
-            mask_key = f"mask_{split}"
-
-            X = data[X_key].copy()
-            mask = data[mask_key]
-
-            if len(X) > 0:
-                X[mask] = (X[mask] - X_mean) / X_std
-
-            data[X_key] = X.astype(np.float32)
-
-
-# -----------------------------
-# Feature normalization
-# -----------------------------
-def fit_X_normalization_from_train(datasets):
-    """
-    Fit X z-score normalization using real AR rows from train splits only.
-
-    This combines PSP + SolO train rows to get one shared X mean/std:
-        X_z = (X - X_mean) / X_std
-
-    Padded AR rows are ignored via mask.
+    This preserves the normalization used in the original code.
     """
     train_real_rows = []
 
@@ -491,80 +433,75 @@ def fit_X_normalization_from_train(datasets):
         if len(X_train) == 0:
             continue
 
-        # X_train[mask_train] has shape [num_real_AR_rows, num_features]
         real_rows = X_train[mask_train]
 
         if len(real_rows) > 0:
             train_real_rows.append(real_rows)
 
     if len(train_real_rows) == 0:
-        raise ValueError("No real train AR rows found for X normalization.")
+        raise ValueError("No real training AR rows")
 
-    train_real_rows = np.concatenate(train_real_rows, axis=0).astype(np.float64)
+    train_real_rows = np.concatenate(
+        train_real_rows, axis=0
+    ).astype(np.float64)
 
     X_mean = np.nanmean(train_real_rows, axis=0)
     X_std = np.nanstd(train_real_rows, axis=0)
 
     X_mean[~np.isfinite(X_mean)] = 0.0
-    X_std[~np.isfinite(X_std)] = 1.0
-    X_std[X_std == 0] = 1.0
+    X_std[~np.isfinite(X_std) | (X_std == 0)] = 1.0
 
     return X_mean.astype(np.float32), X_std.astype(np.float32)
 
 
 def apply_X_normalization_to_splits(datasets, X_mean, X_std):
     """
-    Apply train-only X z-score normalization to real AR rows in train/val/test.
+    Apply shared train-only feature normalization.
 
-    Padded AR rows remain zero.
+    Padded AR rows remain exactly zero.
     """
     for sat, data in datasets.items():
-        for split in ["train", "val", "test"]:
-            X_key = f"X_{split}"
-            mask_key = f"mask_{split}"
-
-            X = data[X_key].copy().astype(np.float32)
-            mask = data[mask_key]
+        for split in SPLITS:
+            X = data[f"X_{split}"].copy()
+            mask = data[f"mask_{split}"]
 
             if len(X) > 0:
                 X[mask] = (X[mask] - X_mean) / X_std
 
-            # Keep padded rows exactly zero.
             X[~mask] = 0.0
+            data[f"X_{split}"] = X.astype(np.float32)
 
-            data[X_key] = X.astype(np.float32)
 
+# ============================================================
+# SATELLITE-SPECIFIC TARGET NORMALIZATION
+# ============================================================
 
-# -----------------------------
-# Y normalization
-# -----------------------------
 def zscore_y_per_satellite_train_stats(datasets, eps=Y_EPS):
     """
-    For each satellite separately:
-      1. log-transform raw Jlinlin: log(y + eps)
-      2. fit mean/std using that satellite's train split only
-      3. apply those train stats to train/val/test
+    Normalize Jlinlin separately for PSP and SolO.
 
-    This prevents PSP and SolO from being normalized against each other's target scale.
+    y_log = log(y_raw + eps)
+    y_z = (y_log - satellite_train_mean) / satellite_train_std
     """
     stats = {}
 
     for sat, data in datasets.items():
+
         y_train_raw = data["y_train_raw"].astype(np.float64)
 
         if len(y_train_raw) == 0:
-            raise ValueError(f"{sat}: empty y_train_raw")
+            raise ValueError(f"{sat}: empty training targets")
 
-        if np.nanmin(y_train_raw) <= -eps:
-            raise ValueError(
-                f"{sat}: y contains values <= -eps, so log(y + eps) is invalid. "
-                f"min y = {np.nanmin(y_train_raw)}"
-            )
+        if (
+            not np.all(np.isfinite(y_train_raw))
+            or np.any(y_train_raw <= -eps)
+        ):
+            raise ValueError(f"{sat}: invalid training targets")
 
         y_train_log = np.log(y_train_raw + eps)
 
-        y_mean = np.nanmean(y_train_log)
-        y_std = np.nanstd(y_train_log)
+        y_mean = np.mean(y_train_log)
+        y_std = np.std(y_train_log)
 
         if not np.isfinite(y_std) or y_std == 0:
             y_std = 1.0
@@ -572,52 +509,49 @@ def zscore_y_per_satellite_train_stats(datasets, eps=Y_EPS):
         stats[sat] = {
             "log_mean": y_mean,
             "log_std": y_std,
-            "raw_train_min": np.nanmin(y_train_raw),
-            "raw_train_median": np.nanmedian(y_train_raw),
-            "raw_train_max": np.nanmax(y_train_raw),
-            "log_train_min": np.nanmin(y_train_log),
-            "log_train_median": np.nanmedian(y_train_log),
-            "log_train_max": np.nanmax(y_train_log),
+            "raw_train_min": np.min(y_train_raw),
+            "raw_train_median": np.median(y_train_raw),
+            "raw_train_max": np.max(y_train_raw),
+            "log_train_min": np.min(y_train_log),
+            "log_train_median": np.median(y_train_log),
+            "log_train_max": np.max(y_train_log),
         }
 
-        for split in ["train", "val", "test"]:
-            raw_key = f"y_{split}_raw"
-            log_key = f"y_{split}_log"
-            z_key = f"y_{split}"
+        for split in SPLITS:
+            raw = data[f"y_{split}_raw"].astype(np.float64)
 
-            y_raw = data[raw_key].astype(np.float64)
-
-            if len(y_raw) == 0:
-                data[log_key] = np.empty((0,), dtype=np.float32)
-                data[z_key] = np.empty((0,), dtype=np.float32)
-                continue
-
-            if np.nanmin(y_raw) <= -eps:
+            if (
+                not np.all(np.isfinite(raw))
+                or np.any(raw <= -eps)
+            ):
                 raise ValueError(
-                    f"{sat} {split}: y contains values <= -eps, so log(y + eps) is invalid. "
-                    f"min y = {np.nanmin(y_raw)}"
+                    f"{sat}: invalid {split} targets"
                 )
 
-            y_log = np.log(y_raw + eps)
-            y_z = (y_log - y_mean) / y_std
+            log_y = np.log(raw + eps)
+            z_y = (log_y - y_mean) / y_std
 
-            data[log_key] = y_log.astype(np.float32)
-            data[z_key] = y_z.astype(np.float32)
+            data[f"y_{split}_log"] = log_y.astype(np.float32)
+            data[f"y_{split}"] = z_y.astype(np.float32)
 
-        z_train = data["y_train"]
-
-        print(f"\n{sat} y normalization check")
-        print("train z min/mean/max:", np.nanmin(z_train), np.nanmean(z_train), np.nanmax(z_train))
-        print("train z < 0:", np.sum(z_train < 0))
-        print("train z > 0:", np.sum(z_train > 0))
+        print(
+            f"{sat.upper()} y normalization: "
+            f"mean={y_mean:.6g}, std={y_std:.6g}"
+        )
 
     return stats
 
 
-# -----------------------------
-# Combine splits
-# -----------------------------
+# ============================================================
+# COMBINE PSP + SOLO SPLITS
+# ============================================================
+
 def combine_splits(datasets, split):
+    """
+    Concatenate PSP and SolO observations within one split.
+
+    All arrays are shuffled using the same permutation.
+    """
     Xs = []
     masks = []
     ys = []
@@ -633,7 +567,14 @@ def combine_splits(datasets, split):
         y_logs.append(data[f"y_{split}_log"])
         y_raws.append(data[f"y_{split}_raw"])
         times.append(data[f"t_{split}"])
-        sats.append(data[f"sat_{split}"])
+
+        sats.append(
+            np.full(
+                len(data[f"t_{split}"]),
+                sat,
+                dtype="<U8"
+            )
+        )
 
     X = np.concatenate(Xs, axis=0).astype(np.float32)
     mask = np.concatenate(masks, axis=0).astype(bool)
@@ -656,112 +597,270 @@ def combine_splits(datasets, split):
     )
 
 
-# -----------------------------
-# Main
-# -----------------------------
+# ============================================================
+# VALIDATE TEMPORAL SPLITS
+# ============================================================
+
+def validate_global_splits(datasets, blocks, assignments):
+    """
+    Check that:
+    1. No exact timestamp is assigned to multiple splits.
+    2. PSP and SolO inherit the same global block assignment.
+    3. All blocks have exactly one split.
+    """
+    split_times = {s: set() for s in SPLITS}
+
+    for sat, data in datasets.items():
+        for split in SPLITS:
+            times = pd.to_datetime(data[f"t_{split}"])
+            split_times[split].update(times)
+
+            X = data[f"X_{split}"]
+            mask = data[f"mask_{split}"]
+            y = data[f"y_{split}"]
+
+            assert X.shape[:2] == mask.shape
+            assert len(X) == len(y)
+            assert np.isfinite(X).all()
+            assert np.isfinite(y).all()
+            assert np.all(X[~mask] == 0.0)
+
+    for i, s1 in enumerate(SPLITS):
+        for s2 in SPLITS[i + 1:]:
+            overlap = split_times[s1] & split_times[s2]
+
+            assert len(overlap) == 0, (
+                f"Temporal leakage between {s1} and {s2}: "
+                f"{len(overlap)} timestamps"
+            )
+
+    assert len(assignments) == len(blocks)
+
+    print("\nPASS: No exact timestamp leakage across PSP/SolO splits.")
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+# 1. Load SEP event times for both satellites.
+all_event_starts = []
+
+for sat, config in SAT_CONFIGS.items():
+    event_times = load_event_times(config)
+    all_event_starts.extend(event_times)
+
+    print(f"{sat.upper()}: {len(event_times)} SEP event starts")
+
+# Merge overlapping 10-day windows globally.
+event_windows = merge_event_windows(all_event_starts)
+
+print("\nMerged global SEP event windows:", len(event_windows))
+
+
+# 2. Build point-level SHARP tensors separately.
+raw_datasets = {}
+
+for sat, config in SAT_CONFIGS.items():
+    raw_datasets[sat] = aggregate_sharp_by_time(
+        config["combined_csv"],
+        satellite_name=sat
+    )
+
+    print(
+        f"{sat.upper()} raw tensor:",
+        raw_datasets[sat]["X_time"].shape
+    )
+
+
+# 3. Construct union of PSP + SolO timestamps.
+all_times = np.unique(
+    np.concatenate([
+        raw_datasets["psp"]["times"],
+        raw_datasets["solo"]["times"]
+    ])
+)
+
+
+# 4. Build shared temporal blocks.
+blocks, global_block_ids, global_times = build_shared_blocks(
+    all_times,
+    event_windows
+)
+
+print("\nGlobal block summary:")
+print("Unique timestamps:", len(global_times))
+print("Event blocks:", sum(b["type"] == "event" for b in blocks))
+print("Non-event blocks:", sum(b["type"] == "non_event" for b in blocks))
+
+
+# 5. Split globally, ONCE.
+assignments = split_shared_blocks(
+    blocks,
+    seed=SEED
+)
+
+print("\nShared block split counts:")
+for split in SPLITS:
+    print(
+        split,
+        sum(v == split for v in assignments.values())
+    )
+
+
+# 6. Extract satellite-specific samples using global splits.
 datasets = {}
 
-for sat_name, config in SAT_CONFIGS.items():
-    datasets[sat_name] = build_satellite_dataset(sat_name, config)
+for sat, raw in raw_datasets.items():
+    datasets[sat] = extract_satellite_splits(
+        raw,
+        global_times,
+        global_block_ids,
+        assignments
+    )
 
-# Pad PSP/SolO to the same AR dimension.
-global_max_ARs = max(data["X_time"].shape[1] for data in datasets.values())
-print("\nGlobal max ARs:", global_max_ARs)
 
-for sat_name, data in datasets.items():
-    for split in ["train", "val", "test"]:
-        X_key = f"X_{split}"
-        mask_key = f"mask_{split}"
+# 7. Pad both satellites to the same AR dimension.
+global_max_ARs = max(
+    raw["X_time"].shape[1]
+    for raw in raw_datasets.values()
+)
 
+print("\nGlobal maximum ARs:", global_max_ARs)
+
+for sat, data in datasets.items():
+    for split in SPLITS:
         X_padded, mask_padded = pad_point_split(
-            data[X_key],
-            data[mask_key],
-            global_max_ARs,
+            data[f"X_{split}"],
+            data[f"mask_{split}"],
+            global_max_ARs
         )
 
-        data[X_key] = X_padded.astype(np.float32)
-        data[mask_key] = mask_padded.astype(bool)
+        data[f"X_{split}"] = X_padded
+        data[f"mask_{split}"] = mask_padded
 
-# Normalize X using combined train real AR rows only.
+
+# 8. Fit SHARP normalization from COMBINED training AR rows.
 X_mean, X_std = fit_X_normalization_from_train(datasets)
-apply_X_normalization_to_splits(datasets, X_mean, X_std)
+
+apply_X_normalization_to_splits(
+    datasets,
+    X_mean,
+    X_std
+)
 
 pd.DataFrame({
     "feature": cols,
     "mean": X_mean,
     "std": X_std,
 }).to_csv(
-    os.path.join(OUT_DIR, "X_point_normalization_stats_combined_na.csv"),
-    index=False,
+    os.path.join(
+        OUT_DIR,
+        "X_point_normalization_stats_combined_na.csv"
+    ),
+    index=False
 )
 
-# Normalize y per satellite using train-only stats.
+
+# 9. Normalize Jlinlin independently per satellite.
 y_stats = zscore_y_per_satellite_train_stats(datasets)
-
-pd.DataFrame({
-    "feature": cols,
-    "mean": X_mean,
-    "std": X_std,
-}).to_csv(
-    os.path.join(OUT_DIR, "X_point_normalization_stats_combined_na.csv"),
-    index=False,
-)
-
-# Normalize y per satellite using train-only stats.
-y_stats = zscore_y_per_satellite_train_stats(datasets)
-
-print("\nY normalization stats, train-only:")
-for sat, st in y_stats.items():
-    print(f"{sat}: log_mean={st['log_mean']:.6g}, log_std={st['log_std']:.6g}")
-
-# Combine PSP + SolO splits.
-X_train, mask_train, y_train, y_train_log, y_train_raw, t_train, sat_train = combine_splits(datasets, "train")
-X_val, mask_val, y_val, y_val_log, y_val_raw, t_val, sat_val = combine_splits(datasets, "val")
-X_test, mask_test, y_test, y_test_log, y_test_raw, t_test, sat_test = combine_splits(datasets, "test")
-
-print("\nCombined shapes")
-print("X_train:", X_train.shape, "mask_train:", mask_train.shape, "y_train:", y_train.shape)
-print("X_val:", X_val.shape, "mask_val:", mask_val.shape, "y_val:", y_val.shape)
-print("X_test:", X_test.shape, "mask_test:", mask_test.shape, "y_test:", y_test.shape)
-
-print("\nSatellite counts")
-for split_name, sat_arr in [("train", sat_train), ("val", sat_val), ("test", sat_test)]:
-    vals, counts = np.unique(sat_arr, return_counts=True)
-    print(split_name, dict(zip(vals, counts)))
-
-# -----------------------------
-# Save outputs
-# -----------------------------
-np.save(os.path.join(OUT_DIR, "X_t_train_combined_na.npy"), X_train)
-np.save(os.path.join(OUT_DIR, "X_t_val_combined_na.npy"), X_val)
-np.save(os.path.join(OUT_DIR, "X_t_test_combined_na.npy"), X_test)
-
-np.save(os.path.join(OUT_DIR, "mask_t_train_combined_na.npy"), mask_train)
-np.save(os.path.join(OUT_DIR, "mask_t_val_combined_na.npy"), mask_val)
-np.save(os.path.join(OUT_DIR, "mask_t_test_combined_na.npy"), mask_test)
-
-np.save(os.path.join(OUT_DIR, "y_t_train_combined_na.npy"), y_train)
-np.save(os.path.join(OUT_DIR, "y_t_val_combined_na.npy"), y_val)
-np.save(os.path.join(OUT_DIR, "y_t_test_combined_na.npy"), y_test)
-
-np.save(os.path.join(OUT_DIR, "y_t_train_combined_na_log.npy"), y_train_log)
-np.save(os.path.join(OUT_DIR, "y_t_val_combined_na_log.npy"), y_val_log)
-np.save(os.path.join(OUT_DIR, "y_t_test_combined_na_log.npy"), y_test_log)
-
-np.save(os.path.join(OUT_DIR, "y_t_train_combined_na_raw.npy"), y_train_raw)
-np.save(os.path.join(OUT_DIR, "y_t_val_combined_na_raw.npy"), y_val_raw)
-np.save(os.path.join(OUT_DIR, "y_t_test_combined_na_raw.npy"), y_test_raw)
-
-np.save(os.path.join(OUT_DIR, "times_t_train_combined_na.npy"), t_train)
-np.save(os.path.join(OUT_DIR, "times_t_val_combined_na.npy"), t_val)
-np.save(os.path.join(OUT_DIR, "times_t_test_combined_na.npy"), t_test)
-
-np.save(os.path.join(OUT_DIR, "sat_t_train_combined_na.npy"), sat_train)
-np.save(os.path.join(OUT_DIR, "sat_t_val_combined_na.npy"), sat_val)
-np.save(os.path.join(OUT_DIR, "sat_t_test_combined_na.npy"), sat_test)
 
 pd.DataFrame(y_stats).T.to_csv(
-    os.path.join(OUT_DIR, "y_point_normalization_stats_by_satellite_na.csv")
+    os.path.join(
+        OUT_DIR,
+        "y_point_normalization_stats_by_satellite_na.csv"
+    )
 )
 
-print(f"\nSaved combined non-aggregated point dataset to {OUT_DIR}/")
+
+# 10. Validate the shared block splitting.
+validate_global_splits(
+    datasets,
+    blocks,
+    assignments
+)
+
+
+# 11. Combine PSP and SolO for each split.
+combined = {}
+
+for split in SPLITS:
+    combined[split] = combine_splits(datasets, split)
+
+
+# 12. Save original combined dataset filenames.
+for split in SPLITS:
+    X, mask, y, y_log, y_raw, t, sat = combined[split]
+
+    np.save(
+        os.path.join(OUT_DIR, f"X_t_{split}_combined_na.npy"),
+        X
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"mask_t_{split}_combined_na.npy"),
+        mask
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"y_t_{split}_combined_na.npy"),
+        y
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"y_t_{split}_combined_na_log.npy"),
+        y_log
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"y_t_{split}_combined_na_raw.npy"),
+        y_raw
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"times_t_{split}_combined_na.npy"),
+        t
+    )
+
+    np.save(
+        os.path.join(OUT_DIR, f"sat_t_{split}_combined_na.npy"),
+        sat
+    )
+
+    print(
+        f"\n{split.upper()} combined shapes:"
+        f"\n  X: {X.shape}"
+        f"\n  mask: {mask.shape}"
+        f"\n  y: {y.shape}"
+        f"\n  PSP samples: {np.sum(sat == 'psp')}"
+        f"\n  SolO samples: {np.sum(sat == 'solo')}"
+    )
+
+
+# 13. Save global timestamp/block assignment manifest.
+block_types = {
+    b["id"]: b["type"]
+    for b in blocks
+}
+
+manifest = pd.DataFrame({
+    "time": global_times,
+    "block_id": global_block_ids,
+    "block_type": [
+        block_types[int(bid)]
+        for bid in global_block_ids
+    ],
+    "split": [
+        assignments[int(bid)]
+        for bid in global_block_ids
+    ],
+})
+
+manifest.to_csv(
+    os.path.join(OUT_DIR, "shared_time_split_combined_na.csv"),
+    index=False
+)
+
+print("\nAll combined datasets saved successfully.")
+print("Output directory:", OUT_DIR)
+print("Shared split manifest: shared_time_split_combined_na.csv")
